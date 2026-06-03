@@ -63,6 +63,31 @@ patch:
 保存后重新部署即可生效。
 
 ## 贡献
+## Contributors
+
+### Human
+
+<a href="https://github.com/Battery-rar/rime-wanxiang-kaomoji/graphs/contributors">
+
+  <img src="https://contrib.rocks/image?repo=Battery-rar/rime-wanxiang-kaomoji" width="50"/>
+
+</a>
+
+### AI
+
+  ChatGPT 5.4
+  
+  Codex
+
+### Cat
+
+<a href="https://github.com/deemoe404">
+
+  <img src="https://github.com/deemoe404.png" width="50"/>
+
+</a>
+
+
 
 ## License
 
