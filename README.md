@@ -65,10 +65,6 @@ patch:
 ## 贡献
 ## Contributors
 
-### Cat
-
-[deemoe404](https://github.com/deemoe404)
-
 ### Human
 
 <a href="https://github.com/Battery-rar/rime-wanxiang-kaomoji/graphs/contributors">
@@ -82,6 +78,14 @@ patch:
   ChatGPT 5.4
   
   Codex
+
+### Cat
+
+<a href="https://github.com/deemoe404">
+
+  <img src="https://github.com/deemoe404.png" width="50"/>
+
+</a>
 
 
 
