@@ -65,6 +65,10 @@ patch:
 ## 贡献
 ## Contributors
 
+### Cat
+
+[deemoe404](https://github.com/deemoe404)
+
 ### Human
 
 <a href="https://github.com/Battery-rar/rime-wanxiang-kaomoji/graphs/contributors">
