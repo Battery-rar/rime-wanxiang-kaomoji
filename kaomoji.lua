@@ -1,78 +1,35 @@
 -- 万象家族 lua，颜文字输入模块
--- 采用 txt 维护数据，支持词典补全与 userdb 持久化缓存
--- 通过 recognizer/patterns/kaomoji 进入
--- 配置示例：
--- kaomoji:
---   db_name: "lua/kaomoji"  # 可选，缓存数据库名称/路径，默认值为 "lua/kaomoji"
---   files:                  # 可选，自定义数据文件列表
---     - lua/data/kaomoji.txt
+-- 目标：
+-- 1. /km 之类的前缀始终保留
+-- 2. 查询链路固定为：提示词 -> 拼音 -> 主翻译器 -> 词语 -> 映射到 kaomoji
 
 local wanxiang = require("wanxiang/wanxiang")
-local userdb = require("wanxiang/userdb")
 
-local DEFAULT_DB_NAME = "lua/kaomoji"
 local DEFAULT_MAX_CANDIDATES = 80
-local DEFAULT_DATA_FILES = {
-    "lua/data/kaomoji.txt",
-    "lua/data/kaomoji_user.txt",
-}
-local DEFAULT_DICT_PATHS = {
-    "dicts/jichu.dict.yaml",
-    "dicts/zi.dict.yaml",
-    "dicts/diming.dict.yaml",
-    "dicts/duoyin.dict.yaml",
-    "dicts/lianxiang.dict.yaml",
-    "dicts/shici.dict.yaml",
-    "dicts/huaxue.dict.yaml",
-    "dicts/yaopin.dict.yaml",
-    "dicts/yixue.dict.yaml",
-    "dicts/cn&en.dict.yaml",
-}
 local BOM = string.char(239, 187, 191)
 local TAB = "\t"
-local ENTRY_KEY_PREFIX = "entry/"
-
-local TONE_MAP = {
-    ["ā"] = "a", ["á"] = "a", ["ǎ"] = "a", ["à"] = "a",
-    ["ē"] = "e", ["é"] = "e", ["ě"] = "e", ["è"] = "e",
-    ["ī"] = "i", ["í"] = "i", ["ǐ"] = "i", ["ì"] = "i",
-    ["ō"] = "o", ["ó"] = "o", ["ǒ"] = "o", ["ò"] = "o",
-    ["ū"] = "u", ["ú"] = "u", ["ǔ"] = "u", ["ù"] = "u",
-    ["ǖ"] = "v", ["ǘ"] = "v", ["ǚ"] = "v", ["ǜ"] = "v", ["ü"] = "v",
-    ["ń"] = "n", ["ň"] = "n", ["ǹ"] = "n",
-    ["ḿ"] = "m",
-}
-
-local META_KEY = {
-    version = "wanxiang_version",
-    files_sig = "files_signature",
-    dict_sig = "dict_signature",
-}
 
 local kaomoji = {
-    files_signature = nil,
-    dict_signature = nil,
+    entries_signature = nil,
     entries = {},
-    db_name = nil,
-    db = nil,
-    db_mode = nil,
+    entries_by_key = {},
 }
 
 local function trim(text)
     return (text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 end
 
-local function normalize_search_code(text)
-    return trim((text or ""):lower():gsub("[^a-z]", ""))
-end
-
 local function strip_bom(text)
-    if not text then return "" end
+    if not text then
+        return ""
+    end
     return text:gsub("^" .. BOM, "")
 end
 
 local function is_absolute_path(path)
-    if not path then return false end
+    if not path then
+        return false
+    end
     return path:sub(1, 1) == "/" or path:sub(1, 1) == "\\" or path:match("^[A-Za-z]:[\\/]")
 end
 
@@ -85,7 +42,9 @@ local function close_file(file, close_fn)
 end
 
 local function open_data_file(path, mode)
-    if not path or path == "" then return nil end
+    if not path or path == "" then
+        return nil
+    end
     if is_absolute_path(path) then
         return io.open(path, mode or "r")
     end
@@ -95,43 +54,110 @@ end
 local function get_config_list(config, path)
     local values = {}
     local list = config:get_list(path)
-    if list then
-        for i = 0, list.size - 1 do
-            local item = list:get_value_at(i)
-            local value = item and trim(item.value) or ""
-            if value ~= "" then
-                table.insert(values, value)
-            end
+    if not list then
+        return values
+    end
+
+    for i = 0, list.size - 1 do
+        local item = list:get_value_at(i)
+        local value = item and trim(item.value) or ""
+        if value ~= "" then
+            values[#values + 1] = value
         end
     end
     return values
 end
 
-local function get_configured_files(config)
-    local files = get_config_list(config, "kaomoji/files")
-    return #files > 0 and files or DEFAULT_DATA_FILES
+local function get_config_string(config, path)
+    local value = config:get_string(path)
+    value = value and trim(value) or ""
+    return value ~= "" and value or nil
 end
 
-local function get_dict_files()
-    local files = {}
-    for _, path in ipairs(DEFAULT_DICT_PATHS) do
-        if wanxiang.get_filename_with_fallback(path) then
-            table.insert(files, path)
+local function get_config_bool(config, path, default_value)
+    local value = config:get_bool(path)
+    if value == nil then
+        return default_value
+    end
+    return value
+end
+
+local function extract_query_prefix(pattern)
+    if not pattern or pattern == "" then
+        return nil
+    end
+
+    local source = pattern
+    local prefix = {}
+    local escaped = false
+
+    if source:sub(1, 1) == "^" then
+        source = source:sub(2)
+    end
+
+    for i = 1, #source do
+        local char = source:sub(i, i)
+        if escaped then
+            prefix[#prefix + 1] = char
+            escaped = false
+        elseif char == "\\" then
+            escaped = true
+        elseif char:match("[%[%]%(%)%*%+%?%$%|%.]") then
+            break
+        else
+            prefix[#prefix + 1] = char
         end
     end
-    return files
+
+    local literal_prefix = table.concat(prefix, "")
+    return literal_prefix ~= "" and literal_prefix or nil
 end
 
-local function for_each_file_line(paths, handler)
-    for _, file_path in ipairs(paths) do
-        local file, close_fn = open_data_file(file_path, "r")
-        if file then
-            for raw_line in file:lines() do
-                handler(raw_line, file_path)
+local function get_query_prefix(config)
+    return extract_query_prefix(get_config_string(config, "recognizer/patterns/kaomoji"))
+end
+
+local function get_allowed_query_chars(config)
+    local allowed = {}
+    local alphabet = get_config_string(config, "speller/alphabet") or ""
+    local delimiter = get_config_string(config, "speller/delimiter") or ""
+
+    for i = 1, #alphabet do
+        allowed[alphabet:sub(i, i):lower()] = true
+    end
+    for i = 1, #delimiter do
+        allowed[delimiter:sub(i, i):lower()] = true
+    end
+    local tone_digits = "7890"
+    for i = 1, #tone_digits do
+        allowed[tone_digits:sub(i, i)] = true
+    end
+
+    return allowed
+end
+
+local function is_valid_query_char(char, allowed_chars)
+    return allowed_chars[char:lower()] == true
+end
+
+local function get_translator_path(config)
+    local translators = config:get_list("engine/translators")
+    if translators then
+        for i = 0, translators.size - 1 do
+            local item = translators:get_value_at(i)
+            local value = item and trim(item.value) or ""
+            local class_name, path = value:match("^([^@]+)@(.+)$")
+            if not class_name then
+                class_name = value
+                path = value == "script_translator" and "translator" or value
             end
-            close_file(file, close_fn)
+            if class_name == "script_translator" then
+                return path, class_name
+            end
         end
     end
+
+    return "translator", "script_translator"
 end
 
 local function get_file_signature(path)
@@ -150,424 +176,375 @@ local function get_file_signature(path)
         file:seek("set", math.floor(size / 2))
         mid = file:read(64) or ""
     end
+
     close_file(file, close_fn)
     return path .. "::" .. size .. "::" .. head .. "::" .. mid .. "::" .. tail
 end
 
--- 轻量文件指纹：文件内容变化时才重新建立索引
 local function generate_files_signature(paths)
-    local sig_parts = {}
+    local parts = {}
     for _, path in ipairs(paths) do
-        table.insert(sig_parts, get_file_signature(path))
+        parts[#parts + 1] = get_file_signature(path)
     end
-    return table.concat(sig_parts, "||")
-end
-
--- 拼音归一化：统一转小写、去声调、过滤非字母字符
-local function normalize_pinyin(text)
-    text = trim(text)
-    if text == "" then return "" end
-
-    for tone, plain in pairs(TONE_MAP) do
-        text = text:gsub(tone, plain)
-    end
-
-    return text:lower()
-        :gsub("[^a-z%s]", " ")
-        :gsub("%s+", " ")
-        :gsub("^%s+", "")
-        :gsub("%s+$", "")
-end
-
-local function build_initials(syllables)
-    local initials = {}
-    for _, syllable in ipairs(syllables) do
-        initials[#initials + 1] = syllable:sub(1, 1)
-    end
-    return table.concat(initials, "")
-end
-
-local function project_syllables(projection, syllables)
-    if not projection then return nil end
-
-    local projected = {}
-    local has_change = false
-    for _, syllable in ipairs(syllables) do
-        local projected_syllable = normalize_search_code(projection:apply(syllable, true))
-        if projected_syllable == "" then
-            projected_syllable = syllable
-        elseif projected_syllable ~= syllable then
-            has_change = true
-        end
-        projected[#projected + 1] = projected_syllable
-    end
-
-    return has_change and projected or nil
-end
-
--- 为一个候选补充可检索编码：全拼 / 首字母 / algebra 投影结果
-local function add_search_form(entry, form)
-    form = trim(form)
-    if form == "" or entry.form_seen[form] then return end
-    entry.form_seen[form] = true
-    table.insert(entry.forms, form)
-end
-
-local function add_code_form(entry, form)
-    add_search_form(entry, normalize_search_code(form))
-end
-
-local function add_pinyin_phrase(entry, raw_pinyin, projection)
-    local normalized = normalize_pinyin(raw_pinyin)
-    if normalized == "" then return end
-
-    local syllables = {}
-    for syllable in normalized:gmatch("%S+") do
-        table.insert(syllables, syllable)
-    end
-    if #syllables == 0 then return end
-
-    add_code_form(entry, table.concat(syllables, ""))
-    add_code_form(entry, build_initials(syllables))
-
-    local projected_syllables = project_syllables(projection, syllables)
-    if projected_syllables then
-        add_code_form(entry, table.concat(projected_syllables, ""))
-        add_code_form(entry, build_initials(projected_syllables))
-    end
-end
-
-local function reset_entry_forms(entries)
-    for _, entry in ipairs(entries) do
-        entry.forms = {}
-        entry.form_seen = {}
-    end
-end
-
-local function get_entry_db_key(entry)
-    return ENTRY_KEY_PREFIX .. entry.key .. TAB .. entry.text
-end
-
-local function new_entry(key, text)
-    return {
-        key = key,
-        text = text,
-        ascii_key = key:lower(),
-        forms = {},
-        form_seen = {},
-    }
+    return table.concat(parts, "||")
 end
 
 local function is_entry_line(line)
     return trim(line) ~= "" and not line:match("^%s*#")
 end
 
--- 从 txt 加载基础数据
--- 格式：关键词 [tab] 颜文字
 function kaomoji.load_entries(files)
     local entries = {}
+    local entries_by_key = {}
     local seen = {}
 
-    for_each_file_line(files, function(raw_line)
-        local line = strip_bom(raw_line)
-        if is_entry_line(line) then
-            local key, text = line:match("^([^\t]+)\t(.+)$")
-            key = trim(key)
-            text = trim(text)
-            if key ~= "" and text ~= "" then
-                local uniq = key .. TAB .. text
-                if not seen[uniq] then
-                    seen[uniq] = true
-                    table.insert(entries, new_entry(key, text))
+    for _, file_path in ipairs(files) do
+        local file, close_fn = open_data_file(file_path, "r")
+        if file then
+            for raw_line in file:lines() do
+                local line = strip_bom(raw_line)
+                if is_entry_line(line) then
+                    local key, text = line:match("^([^\t]+)\t(.+)$")
+                    key = trim(key)
+                    text = trim(text)
+                    if key ~= "" and text ~= "" then
+                        local uniq = key .. TAB .. text
+                        if not seen[uniq] then
+                            seen[uniq] = true
+                            local entry = { key = key, text = text }
+                            entries[#entries + 1] = entry
+                            entries_by_key[key] = entries_by_key[key] or {}
+                            entries_by_key[key][#entries_by_key[key] + 1] = entry
+                        end
+                    end
                 end
             end
-        end
-    end)
-
-    return entries
-end
-
--- 用万象现有词典补齐拼音，兼容只写“关键词 + 颜文字”的简洁格式
-function kaomoji.enrich_entries(entries, dict_files, projection)
-    local wanted = {}
-    for _, entry in ipairs(entries) do
-        wanted[entry.key] = wanted[entry.key] or {}
-        table.insert(wanted[entry.key], entry)
-    end
-
-    for_each_file_line(dict_files, function(raw_line)
-        local line = strip_bom(raw_line)
-        local word, pinyin = line:match("^([^\t]+)\t([^\t]+)")
-        local matched = word and wanted[word]
-        if matched and pinyin and pinyin ~= "" then
-            for _, entry in ipairs(matched) do
-                add_pinyin_phrase(entry, pinyin, projection)
-            end
-        end
-    end)
-end
-
-local function set_db_mode(db, writable)
-    local mode = writable and "rw" or "ro"
-    if kaomoji.db_mode == mode then return db end
-
-    if kaomoji.db_mode then
-        db:close()
-    end
-    if writable then
-        db:open()
-    else
-        db:open_read_only()
-    end
-    kaomoji.db_mode = mode
-    return db
-end
-
-local function is_db_cache_valid(db, files_sig, dict_sig)
-    return db
-        and db:meta_fetch(META_KEY.version) == wanxiang.version
-        and (db:meta_fetch(META_KEY.files_sig) or "") == files_sig
-        and (db:meta_fetch(META_KEY.dict_sig) or "") == dict_sig
-end
-
-local function load_entry_forms(raw, entry)
-    if raw and raw ~= "" then
-        for form in raw:gmatch("[^\t]+") do
-            add_search_form(entry, form)
+            close_file(file, close_fn)
         end
     end
+
+    return entries, entries_by_key
 end
 
-local function get_dict_signature(dict_files)
-    return table.concat(dict_files, "\n") .. "::" .. generate_files_signature(dict_files)
-end
-
-local function clear_db(db)
-    local clear = db["clear"]
-    if clear then
-        clear(db)
-    elseif db.empty then
-        db:empty(true)
+function kaomoji.ensure_entries_loaded(env)
+    local signature = generate_files_signature(env.kaomoji_files)
+    if kaomoji.entries_signature ~= signature then
+        kaomoji.entries, kaomoji.entries_by_key = kaomoji.load_entries(env.kaomoji_files)
+        kaomoji.entries_signature = signature
     end
+    return kaomoji.entries, kaomoji.entries_by_key
 end
 
-local function is_query_match(forms, query)
-    for _, form in ipairs(forms) do
-        if form:find(query, 1, true) == 1 then
-            return true
-        end
+local function ensure_main_translator(env)
+    if env.kaomoji_main_translator then
+        return env.kaomoji_main_translator
     end
-    return false
-end
-
-local function get_active_entries(env, query)
-    if query == "" then
-        return kaomoji.ensure_entries_loaded(env)
-    end
-    return kaomoji.ensure_dict_loaded(env)
-end
-
-local function extract_query_prefix(pattern)
-    if not pattern or pattern == "" then
+    if not (Component and Component.Translator) then
         return nil
     end
 
-    local source = pattern
-    local prefix = {}
-    local started = false
-    local escaped = false
+    local ok, translator = pcall(function()
+        return Component.Translator(env.engine, env.kaomoji_translator_path, env.kaomoji_translator_class)
+    end)
+    if ok then
+        env.kaomoji_main_translator = translator
+    end
+    return env.kaomoji_main_translator
+end
 
-    if source:sub(1, 1) == "^" then
-        source = source:sub(2)
+local function build_lookup_segment(query)
+    local lookup_seg = Segment(0, #query)
+    lookup_seg.tags = Set({ "abc" })
+    return lookup_seg
+end
+
+local function get_script_text_parts(ctx)
+    local parts = {}
+    if not ctx or not ctx.composition or ctx.composition:empty() then
+        return parts
     end
 
-    for i = 1, #source do
-        local char = source:sub(i, i)
-        if escaped then
-            prefix[#prefix + 1] = char
-            started = true
-            escaped = false
-        elseif char == "\\" then
-            escaped = true
-        elseif char:match("[%[%]%(%)%*%+%?%$%|%.]") then
-            break
-        else
-            prefix[#prefix + 1] = char
-            started = true
+    local spans = ctx.composition:spans()
+    if not spans then
+        return parts
+    end
+
+    local count = type(spans.count) == "function" and spans:count() or spans.count
+    if count == 0 then
+        return parts
+    end
+
+    local vertices = type(spans.vertices) == "function" and spans:vertices() or spans.vertices
+    if not vertices or #vertices < 2 then
+        return parts
+    end
+
+    local raw_input = ctx.input or ""
+    for i = 1, #vertices - 1 do
+        local raw_syllable = raw_input:sub(vertices[i] + 1, vertices[i + 1])
+        if raw_syllable and raw_syllable ~= "" then
+            raw_syllable = raw_syllable:gsub("['%s]", "")
+            if raw_syllable ~= "" then
+                parts[#parts + 1] = raw_syllable
+            end
         end
     end
 
-    local literal_prefix = table.concat(prefix, "")
-    if not started or literal_prefix == "" then return nil end
-    return literal_prefix
+    return parts
 end
 
-local function get_kaomoji_query(input, seg, env)
+local function split_tone_query(query)
+    local clean = {}
+    local tones = {}
+
+    for i = 1, #query do
+        local char = query:sub(i, i)
+        if char == "7" or char == "8" or char == "9" or char == "0" then
+            tones[#tones + 1] = char
+        else
+            clean[#clean + 1] = char
+        end
+    end
+
+    return table.concat(clean), tones
+end
+
+local function compress_tone_runs_keep_last(text)
+    return (text:gsub("([7890])([7890]+)", function(_, tail)
+        return tail:sub(-1)
+    end))
+end
+
+local function build_tone_fallback_query(env, tone_filter_seq)
+    if #tone_filter_seq == 0 then
+        return nil
+    end
+
+    local syllables = get_script_text_parts(env.engine.context)
+    if #syllables == 0 then
+        return nil
+    end
+
+    local prefix = env.kaomoji_prefix or ""
+    if prefix ~= "" and syllables[1] and syllables[1]:sub(1, #prefix) == prefix then
+        syllables[1] = syllables[1]:sub(#prefix + 1)
+    end
+    if syllables[1] == "" then
+        table.remove(syllables, 1)
+    end
+    if #syllables ~= #tone_filter_seq then
+        return nil
+    end
+
+    local query_parts = {}
+    for i, tone in ipairs(tone_filter_seq) do
+        local syllable = syllables[i]
+        if not syllable or syllable == "" then
+            return nil
+        end
+        if #syllable > 2 then
+            syllable = syllable:sub(1, 2)
+        end
+        query_parts[#query_parts + 1] = syllable .. tone
+    end
+
+    return table.concat(query_parts)
+end
+
+local function normalize_lookup_query(env, query)
+    if not env.kaomoji_enable_tone_fallback then
+        return query
+    end
+
+    local normalized = compress_tone_runs_keep_last(query)
+    local clean_query, tone_filter_seq = split_tone_query(normalized)
+    if clean_query ~= "" then
+        return normalized
+    end
+
+    local fallback_query = build_tone_fallback_query(env, tone_filter_seq)
+    if fallback_query and fallback_query ~= "" then
+        return fallback_query
+    end
+    return normalized
+end
+
+local function get_query_info(input, seg, env)
     if not seg:has_tag("kaomoji") then
         return nil
     end
 
-    local prefix = env.kmj_prefix
-    if not prefix or prefix == "" then return nil end
+    local prefix = env.kaomoji_prefix
+    if not prefix or prefix == "" then
+        return nil
+    end
     if input:sub(1, #prefix) ~= prefix then
         return nil
     end
 
-    local query = input:sub(#prefix + 1):lower()
-    if query:find("[^a-z]") then
+    local query = input:sub(#prefix + 1)
+    for i = 1, #query do
+        if not is_valid_query_char(query:sub(i, i), env.kaomoji_allowed_chars) then
+            return nil
+        end
+    end
+
+    return {
+        raw_input = input,
+        prefix = prefix,
+        query = query:lower(),
+    }
+end
+
+local function query_main_translation(env, query)
+    local translator = ensure_main_translator(env)
+    if not translator then
         return nil
     end
-    return query
-end
 
-local function get_db_name(config)
-    local db_name = config:get_string("kaomoji/db_name") or DEFAULT_DB_NAME
-    return db_name ~= "" and db_name or DEFAULT_DB_NAME
-end
-
-local function get_query_prefix(config)
-    return extract_query_prefix(config:get_string("recognizer/patterns/kaomoji"))
-end
-
-local function get_algebra_projection(config)
-    local algebra_list = config:get_list("speller/algebra")
-    if not algebra_list or algebra_list.size == 0 then
+    local lookup_query = normalize_lookup_query(env, query)
+    local ok, translation = pcall(function()
+        return translator:query(lookup_query, build_lookup_segment(lookup_query))
+    end)
+    if not ok then
         return nil
     end
-
-    local projection = Projection()
-    if projection and projection:load(algebra_list) then
-        return projection
-    end
-    return nil
+    return translation
 end
 
-local function build_candidate(seg, entry, yielded)
-    local cand = Candidate("kaomoji", seg.start, seg._end, entry.text, entry.key)
+local function get_tone_preedit_map(env)
+    if env.kaomoji_tone_map then
+        return env.kaomoji_tone_map
+    end
+
+    local tone_map = {}
+    local cfg = env.engine and env.engine.schema and env.engine.schema.config
+    for d = 0, 9 do
+        local key = tostring(d)
+        local value = cfg and cfg:get_string("tone_preedit/" .. key)
+        tone_map[key] = (value and value ~= "") and value or key
+    end
+
+    env.kaomoji_tone_map = tone_map
+    return tone_map
+end
+
+local function apply_tone_preedit(env, preedit)
+    if not preedit or preedit == "" then
+        return preedit
+    end
+
+    local tone_map = get_tone_preedit_map(env)
+    return preedit:gsub("([^%d%s]+)(%d+)", function(body, digits)
+        local mapped = digits:gsub("%d", function(d)
+            return tone_map[d] or d
+        end)
+        return body .. mapped
+    end)
+end
+
+local function build_candidate(seg, match, yielded, env)
+    local cand = Candidate("kaomoji", seg.start, seg._end, match.text, match.comment or "")
     cand.quality = 1000000 - yielded
+    -- 保留 /km 前缀，不让提示词在候选 preedit 中消失。
+    cand.preedit = apply_tone_preedit(env, match.preedit)
     return cand
 end
 
-local function ensure_db(env, writable)
-    if not kaomoji.db or kaomoji.db_name ~= env.kmj_db_name then
-        if kaomoji.db and kaomoji.db_mode then
-            kaomoji.db:close()
-        end
-        kaomoji.db_name = env.kmj_db_name
-        kaomoji.db = userdb.LevelDb(env.kmj_db_name)
-        kaomoji.db_mode = nil
-    end
-
-    return set_db_mode(kaomoji.db, writable)
-end
-
-local function load_forms_from_db(env, files_sig, dict_sig, entries)
-    local db = ensure_db(env, false)
-    if not is_db_cache_valid(db, files_sig, dict_sig) then return false end
-
-    reset_entry_forms(entries)
-    for _, entry in ipairs(entries) do
-        load_entry_forms(db:fetch(get_entry_db_key(entry)), entry)
-    end
-    return true
-end
-
-local function save_forms_to_db(env, files_sig, dict_sig, entries)
-    local db = ensure_db(env, true)
-    if not db then return end
-
-    clear_db(db)
-
-    for _, entry in ipairs(entries) do
-        if #entry.forms > 0 then
-            db:update(get_entry_db_key(entry), table.concat(entry.forms, TAB))
-        end
-    end
-
-    db:meta_update(META_KEY.version, wanxiang.version)
-    db:meta_update(META_KEY.files_sig, files_sig)
-    db:meta_update(META_KEY.dict_sig, dict_sig)
-
-    db:close()
-    db:open_read_only()
-    kaomoji.db_mode = "ro"
-end
-
--- 基础缓存：文件内容变化时才重建基础条目，首次 /km 空查询只走这一层
-function kaomoji.ensure_entries_loaded(env)
-    local files_signature = generate_files_signature(env.kmj_files)
-    if kaomoji.files_signature ~= files_signature then
-        kaomoji.entries = kaomoji.load_entries(env.kmj_files)
-        kaomoji.files_signature = files_signature
-        kaomoji.dict_signature = nil
-    end
-
-    return kaomoji.entries
-end
-
--- 拼音缓存：只有真正按拼音检索时，才扫描万象词典补齐编码
-function kaomoji.ensure_dict_loaded(env)
-    kaomoji.ensure_entries_loaded(env)
-
-    local files_sig = kaomoji.files_signature or ""
-    local dict_signature = get_dict_signature(env.kmj_dict_files)
-    if kaomoji.dict_signature ~= dict_signature then
-        if not load_forms_from_db(env, files_sig, dict_signature, kaomoji.entries) then
-            reset_entry_forms(kaomoji.entries)
-            kaomoji.enrich_entries(kaomoji.entries, env.kmj_dict_files, env.kmj_projection)
-            save_forms_to_db(env, files_sig, dict_signature, kaomoji.entries)
-        end
-        kaomoji.dict_signature = dict_signature
-    end
-
-    return kaomoji.entries
-end
-
--- 匹配策略：支持关键词前缀、拼音全拼、首字母与模糊简拼
-local function match_entry(entry, query)
-    if query == "" or entry.ascii_key:find(query, 1, true) then
-        return true
-    end
-    return is_query_match(entry.forms, query)
-end
-
--- 收集候选：保持原文件顺序，同一颜文字只输出一次
-local function collect_matches(env, query)
+local function collect_all_entries(env, raw_input)
+    local entries = kaomoji.ensure_entries_loaded(env)
     local matched = {}
     local seen = {}
-    local entries = get_active_entries(env, query)
 
     for _, entry in ipairs(entries) do
-        if match_entry(entry, query) and not seen[entry.text] then
+        if not seen[entry.text] then
             seen[entry.text] = true
-            table.insert(matched, entry)
+            matched[#matched + 1] = {
+                text = entry.text,
+                comment = entry.key,
+                preedit = raw_input,
+            }
         end
     end
 
     return matched
 end
 
--- 初始化：读取配置并预热 userdb 缓存
-function kaomoji.init(env)
-    local config = env.engine.schema.config
+local function collect_matches_once(env, query, raw_input)
+    local _, entries_by_key = kaomoji.ensure_entries_loaded(env)
+    local translation = query_main_translation(env, query)
+    if not translation then
+        return {}
+    end
 
-    env.kmj_db_name = get_db_name(config)
-    env.kmj_prefix = get_query_prefix(config)
-    env.kmj_projection = get_algebra_projection(config)
-    env.kmj_files = get_configured_files(config)
-    env.kmj_dict_files = get_dict_files()
+    local matched = {}
+    local seen = {}
 
-    kaomoji.ensure_dict_loaded(env)
+    for main_cand in translation:iter() do
+        local group = entries_by_key[main_cand.text]
+        if group then
+            for _, entry in ipairs(group) do
+                if not seen[entry.text] then
+                    seen[entry.text] = true
+                    matched[#matched + 1] = {
+                        text = entry.text,
+                        comment = entry.key,
+                        preedit = raw_input,
+                    }
+                    if #matched >= DEFAULT_MAX_CANDIDATES then
+                        return matched
+                    end
+                end
+            end
+        end
+    end
+
+    return matched
 end
 
--- translator 主入口：解析 query、生成候选、按排序结果输出
+local function collect_matches_from_translation(env, query, raw_input)
+    local fallback_query = query
+
+    while true do
+        if fallback_query == "" then
+            return collect_all_entries(env, raw_input)
+        end
+
+        local matched = collect_matches_once(env, fallback_query, raw_input)
+        if #matched > 0 then
+            return matched
+        end
+        fallback_query = fallback_query:sub(1, #fallback_query - 1)
+    end
+end
+
+function kaomoji.init(env)
+    local config = env.engine.schema.config
+    env.kaomoji_prefix = get_query_prefix(config)
+    env.kaomoji_files = get_config_list(config, "kaomoji/files")
+    env.kaomoji_allowed_chars = get_allowed_query_chars(config)
+    env.kaomoji_translator_path, env.kaomoji_translator_class = get_translator_path(config)
+    env.kaomoji_enable_tone_fallback = get_config_bool(config, "super_processor/enable_tone_fallback", true)
+
+    kaomoji.ensure_entries_loaded(env)
+end
+
 function kaomoji.func(input, seg, env)
-    local query = get_kaomoji_query(input, seg, env)
-    if query == nil then return end
+    local info = get_query_info(input, seg, env)
+    if info == nil then
+        return
+    end
+
+    local matches
+    if info.query == "" then
+        matches = collect_all_entries(env, info.raw_input)
+    else
+        matches = collect_matches_from_translation(env, info.query, info.raw_input)
+    end
 
     local yielded = 0
-    for _, entry in ipairs(collect_matches(env, query)) do
-        yield(build_candidate(seg, entry, yielded))
+    for _, match in ipairs(matches) do
+        yield(build_candidate(seg, match, yielded, env))
         yielded = yielded + 1
         if yielded >= DEFAULT_MAX_CANDIDATES then
             return
