@@ -1,17 +1,15 @@
 -- 万象家族 lua，颜文字输入模块
 -- 采用 txt 维护数据，支持词典补全与 userdb 持久化缓存
--- 默认触发形式为 /kmj[pinyin]
+-- 通过 recognizer/patterns/kaomoji 进入
 -- 配置示例：
 -- kaomoji:
 --   db_name: "lua/kaomoji"  # 可选，缓存数据库名称/路径，默认值为 "lua/kaomoji"
---   kaomoji_key: "/kmj"     # 可选，触发前缀
 --   files:                  # 可选，自定义数据文件列表
 --     - lua/data/kaomoji.txt
 
 local wanxiang = require("wanxiang/wanxiang")
 local userdb = require("wanxiang/userdb")
 
-local DEFAULT_KEY = "/kmj"
 local DEFAULT_DB_NAME = "lua/kaomoji"
 local DEFAULT_MAX_CANDIDATES = 80
 local DEFAULT_DATA_FILES = {
@@ -64,6 +62,10 @@ local function trim(text)
     return (text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 end
 
+local function normalize_search_code(text)
+    return trim((text or ""):lower():gsub("[^a-z]", ""))
+end
+
 local function strip_bom(text)
     if not text then return "" end
     return text:gsub("^" .. BOM, "")
@@ -90,18 +92,23 @@ local function open_data_file(path, mode)
     return wanxiang.load_file_with_fallback(path, mode)
 end
 
-local function get_configured_files(config)
-    local files = {}
-    local list = config:get_list("kaomoji/files")
+local function get_config_list(config, path)
+    local values = {}
+    local list = config:get_list(path)
     if list then
         for i = 0, list.size - 1 do
             local item = list:get_value_at(i)
-            local path = item and trim(item.value) or ""
-            if path ~= "" then
-                table.insert(files, path)
+            local value = item and trim(item.value) or ""
+            if value ~= "" then
+                table.insert(values, value)
             end
         end
     end
+    return values
+end
+
+local function get_configured_files(config)
+    local files = get_config_list(config, "kaomoji/files")
     return #files > 0 and files or DEFAULT_DATA_FILES
 end
 
@@ -115,27 +122,43 @@ local function get_dict_files()
     return files
 end
 
+local function for_each_file_line(paths, handler)
+    for _, file_path in ipairs(paths) do
+        local file, close_fn = open_data_file(file_path, "r")
+        if file then
+            for raw_line in file:lines() do
+                handler(raw_line, file_path)
+            end
+            close_file(file, close_fn)
+        end
+    end
+end
+
+local function get_file_signature(path)
+    local file, close_fn = open_data_file(path, "rb")
+    if not file then
+        return path .. "::missing"
+    end
+
+    local size = file:seek("end") or 0
+    local head, mid, tail = "", "", ""
+    if size > 0 then
+        file:seek("set", 0)
+        head = file:read(64) or ""
+        file:seek("set", math.max(size - 64, 0))
+        tail = file:read(64) or ""
+        file:seek("set", math.floor(size / 2))
+        mid = file:read(64) or ""
+    end
+    close_file(file, close_fn)
+    return path .. "::" .. size .. "::" .. head .. "::" .. mid .. "::" .. tail
+end
+
 -- 轻量文件指纹：文件内容变化时才重新建立索引
 local function generate_files_signature(paths)
     local sig_parts = {}
     for _, path in ipairs(paths) do
-        local file, close_fn = open_data_file(path, "rb")
-        if file then
-            local size = file:seek("end") or 0
-            local head, mid, tail = "", "", ""
-            if size > 0 then
-                file:seek("set", 0)
-                head = file:read(64) or ""
-                file:seek("set", math.max(size - 64, 0))
-                tail = file:read(64) or ""
-                file:seek("set", math.floor(size / 2))
-                mid = file:read(64) or ""
-            end
-            close_file(file, close_fn)
-            table.insert(sig_parts, path .. "::" .. size .. "::" .. head .. "::" .. mid .. "::" .. tail)
-        else
-            table.insert(sig_parts, path .. "::missing")
-        end
+        table.insert(sig_parts, get_file_signature(path))
     end
     return table.concat(sig_parts, "||")
 end
@@ -156,7 +179,33 @@ local function normalize_pinyin(text)
         :gsub("%s+$", "")
 end
 
--- 为一个候选补充可检索编码：全拼 / 首字母 / zh ch sh 模糊形式
+local function build_initials(syllables)
+    local initials = {}
+    for _, syllable in ipairs(syllables) do
+        initials[#initials + 1] = syllable:sub(1, 1)
+    end
+    return table.concat(initials, "")
+end
+
+local function project_syllables(projection, syllables)
+    if not projection then return nil end
+
+    local projected = {}
+    local has_change = false
+    for _, syllable in ipairs(syllables) do
+        local projected_syllable = normalize_search_code(projection:apply(syllable, true))
+        if projected_syllable == "" then
+            projected_syllable = syllable
+        elseif projected_syllable ~= syllable then
+            has_change = true
+        end
+        projected[#projected + 1] = projected_syllable
+    end
+
+    return has_change and projected or nil
+end
+
+-- 为一个候选补充可检索编码：全拼 / 首字母 / algebra 投影结果
 local function add_search_form(entry, form)
     form = trim(form)
     if form == "" or entry.form_seen[form] then return end
@@ -164,7 +213,11 @@ local function add_search_form(entry, form)
     table.insert(entry.forms, form)
 end
 
-local function add_pinyin_phrase(entry, raw_pinyin)
+local function add_code_form(entry, form)
+    add_search_form(entry, normalize_search_code(form))
+end
+
+local function add_pinyin_phrase(entry, raw_pinyin, projection)
     local normalized = normalize_pinyin(raw_pinyin)
     if normalized == "" then return end
 
@@ -174,25 +227,14 @@ local function add_pinyin_phrase(entry, raw_pinyin)
     end
     if #syllables == 0 then return end
 
-    add_search_form(entry, table.concat(syllables, ""))
+    add_code_form(entry, table.concat(syllables, ""))
+    add_code_form(entry, build_initials(syllables))
 
-    local initials = {}
-    local fuzzy = {}
-    local fuzzy_initials = {}
-    for _, syllable in ipairs(syllables) do
-        table.insert(initials, syllable:sub(1, 1))
-
-        local fuzzy_syllable = syllable
-            :gsub("^zh", "z")
-            :gsub("^ch", "c")
-            :gsub("^sh", "s")
-        table.insert(fuzzy, fuzzy_syllable)
-        table.insert(fuzzy_initials, fuzzy_syllable:sub(1, 1))
+    local projected_syllables = project_syllables(projection, syllables)
+    if projected_syllables then
+        add_code_form(entry, table.concat(projected_syllables, ""))
+        add_code_form(entry, build_initials(projected_syllables))
     end
-
-    add_search_form(entry, table.concat(initials, ""))
-    add_search_form(entry, table.concat(fuzzy, ""))
-    add_search_form(entry, table.concat(fuzzy_initials, ""))
 end
 
 local function reset_entry_forms(entries)
@@ -206,67 +248,204 @@ local function get_entry_db_key(entry)
     return ENTRY_KEY_PREFIX .. entry.key .. TAB .. entry.text
 end
 
+local function new_entry(key, text)
+    return {
+        key = key,
+        text = text,
+        ascii_key = key:lower(),
+        forms = {},
+        form_seen = {},
+    }
+end
+
+local function is_entry_line(line)
+    return trim(line) ~= "" and not line:match("^%s*#")
+end
+
 -- 从 txt 加载基础数据
 -- 格式：关键词 [tab] 颜文字
 function kaomoji.load_entries(files)
     local entries = {}
     local seen = {}
 
-    for _, file_path in ipairs(files) do
-        local file, close_fn = open_data_file(file_path, "r")
-        if file then
-            for raw_line in file:lines() do
-                local line = strip_bom(raw_line)
-                if trim(line) ~= "" and not line:match("^%s*#") then
-                    local key, text = line:match("^([^\t]+)\t(.+)$")
-                    key = trim(key)
-                    text = trim(text)
-                    if key ~= "" and text ~= "" then
-                        local uniq = key .. TAB .. text
-                        if not seen[uniq] then
-                            seen[uniq] = true
-                            table.insert(entries, {
-                                key = key,
-                                text = text,
-                                ascii_key = key:lower(),
-                                forms = {},
-                                form_seen = {},
-                            })
-                        end
-                    end
+    for_each_file_line(files, function(raw_line)
+        local line = strip_bom(raw_line)
+        if is_entry_line(line) then
+            local key, text = line:match("^([^\t]+)\t(.+)$")
+            key = trim(key)
+            text = trim(text)
+            if key ~= "" and text ~= "" then
+                local uniq = key .. TAB .. text
+                if not seen[uniq] then
+                    seen[uniq] = true
+                    table.insert(entries, new_entry(key, text))
                 end
             end
-            close_file(file, close_fn)
         end
-    end
+    end)
 
     return entries
 end
 
 -- 用万象现有词典补齐拼音，兼容只写“关键词 + 颜文字”的简洁格式
-function kaomoji.enrich_entries(entries, dict_files)
+function kaomoji.enrich_entries(entries, dict_files, projection)
     local wanted = {}
     for _, entry in ipairs(entries) do
         wanted[entry.key] = wanted[entry.key] or {}
         table.insert(wanted[entry.key], entry)
     end
 
-    for _, file_path in ipairs(dict_files) do
-        local file, close_fn = open_data_file(file_path, "r")
-        if file then
-            for raw_line in file:lines() do
-                local line = strip_bom(raw_line)
-                local word, pinyin = line:match("^([^\t]+)\t([^\t]+)")
-                local matched = word and wanted[word]
-                if matched and pinyin and pinyin ~= "" then
-                    for _, entry in ipairs(matched) do
-                        add_pinyin_phrase(entry, pinyin)
-                    end
-                end
+    for_each_file_line(dict_files, function(raw_line)
+        local line = strip_bom(raw_line)
+        local word, pinyin = line:match("^([^\t]+)\t([^\t]+)")
+        local matched = word and wanted[word]
+        if matched and pinyin and pinyin ~= "" then
+            for _, entry in ipairs(matched) do
+                add_pinyin_phrase(entry, pinyin, projection)
             end
-            close_file(file, close_fn)
+        end
+    end)
+end
+
+local function set_db_mode(db, writable)
+    local mode = writable and "rw" or "ro"
+    if kaomoji.db_mode == mode then return db end
+
+    if kaomoji.db_mode then
+        db:close()
+    end
+    if writable then
+        db:open()
+    else
+        db:open_read_only()
+    end
+    kaomoji.db_mode = mode
+    return db
+end
+
+local function is_db_cache_valid(db, files_sig, dict_sig)
+    return db
+        and db:meta_fetch(META_KEY.version) == wanxiang.version
+        and (db:meta_fetch(META_KEY.files_sig) or "") == files_sig
+        and (db:meta_fetch(META_KEY.dict_sig) or "") == dict_sig
+end
+
+local function load_entry_forms(raw, entry)
+    if raw and raw ~= "" then
+        for form in raw:gmatch("[^\t]+") do
+            add_search_form(entry, form)
         end
     end
+end
+
+local function get_dict_signature(dict_files)
+    return table.concat(dict_files, "\n") .. "::" .. generate_files_signature(dict_files)
+end
+
+local function clear_db(db)
+    local clear = db["clear"]
+    if clear then
+        clear(db)
+    elseif db.empty then
+        db:empty(true)
+    end
+end
+
+local function is_query_match(forms, query)
+    for _, form in ipairs(forms) do
+        if form:find(query, 1, true) == 1 then
+            return true
+        end
+    end
+    return false
+end
+
+local function get_active_entries(env, query)
+    if query == "" then
+        return kaomoji.ensure_entries_loaded(env)
+    end
+    return kaomoji.ensure_dict_loaded(env)
+end
+
+local function extract_query_prefix(pattern)
+    if not pattern or pattern == "" then
+        return nil
+    end
+
+    local source = pattern
+    local prefix = {}
+    local started = false
+    local escaped = false
+
+    if source:sub(1, 1) == "^" then
+        source = source:sub(2)
+    end
+
+    for i = 1, #source do
+        local char = source:sub(i, i)
+        if escaped then
+            prefix[#prefix + 1] = char
+            started = true
+            escaped = false
+        elseif char == "\\" then
+            escaped = true
+        elseif char:match("[%[%]%(%)%*%+%?%$%|%.]") then
+            break
+        else
+            prefix[#prefix + 1] = char
+            started = true
+        end
+    end
+
+    local literal_prefix = table.concat(prefix, "")
+    if not started or literal_prefix == "" then return nil end
+    return literal_prefix
+end
+
+local function get_kaomoji_query(input, seg, env)
+    if not seg:has_tag("kaomoji") then
+        return nil
+    end
+
+    local prefix = env.kmj_prefix
+    if not prefix or prefix == "" then return nil end
+    if input:sub(1, #prefix) ~= prefix then
+        return nil
+    end
+
+    local query = input:sub(#prefix + 1):lower()
+    if query:find("[^a-z]") then
+        return nil
+    end
+    return query
+end
+
+local function get_db_name(config)
+    local db_name = config:get_string("kaomoji/db_name") or DEFAULT_DB_NAME
+    return db_name ~= "" and db_name or DEFAULT_DB_NAME
+end
+
+local function get_query_prefix(config)
+    return extract_query_prefix(config:get_string("recognizer/patterns/kaomoji"))
+end
+
+local function get_algebra_projection(config)
+    local algebra_list = config:get_list("speller/algebra")
+    if not algebra_list or algebra_list.size == 0 then
+        return nil
+    end
+
+    local projection = Projection()
+    if projection and projection:load(algebra_list) then
+        return projection
+    end
+    return nil
+end
+
+local function build_candidate(seg, entry, yielded)
+    local cand = Candidate("kaomoji", seg.start, seg._end, entry.text, entry.key)
+    cand.quality = 1000000 - yielded
+    return cand
 end
 
 local function ensure_db(env, writable)
@@ -279,36 +458,16 @@ local function ensure_db(env, writable)
         kaomoji.db_mode = nil
     end
 
-    local mode = writable and "rw" or "ro"
-    if kaomoji.db_mode == mode then return kaomoji.db end
-
-    if kaomoji.db_mode then
-        kaomoji.db:close()
-    end
-    if writable then
-        kaomoji.db:open()
-    else
-        kaomoji.db:open_read_only()
-    end
-    kaomoji.db_mode = mode
-    return kaomoji.db
+    return set_db_mode(kaomoji.db, writable)
 end
 
 local function load_forms_from_db(env, files_sig, dict_sig, entries)
     local db = ensure_db(env, false)
-    if not db then return false end
-    if db:meta_fetch(META_KEY.version) ~= wanxiang.version then return false end
-    if (db:meta_fetch(META_KEY.files_sig) or "") ~= files_sig then return false end
-    if (db:meta_fetch(META_KEY.dict_sig) or "") ~= dict_sig then return false end
+    if not is_db_cache_valid(db, files_sig, dict_sig) then return false end
 
     reset_entry_forms(entries)
     for _, entry in ipairs(entries) do
-        local raw = db:fetch(get_entry_db_key(entry))
-        if raw and raw ~= "" then
-            for form in raw:gmatch("[^\t]+") do
-                add_search_form(entry, form)
-            end
-        end
+        load_entry_forms(db:fetch(get_entry_db_key(entry)), entry)
     end
     return true
 end
@@ -317,12 +476,7 @@ local function save_forms_to_db(env, files_sig, dict_sig, entries)
     local db = ensure_db(env, true)
     if not db then return end
 
-    local clear = db["clear"]
-    if clear then
-        clear(db)
-    elseif db.empty then
-        db:empty(true)
-    end
+    clear_db(db)
 
     for _, entry in ipairs(entries) do
         if #entry.forms > 0 then
@@ -339,7 +493,7 @@ local function save_forms_to_db(env, files_sig, dict_sig, entries)
     kaomoji.db_mode = "ro"
 end
 
--- 基础缓存：文件内容变化时才重建基础条目，首次 /kmj 空查询只走这一层
+-- 基础缓存：文件内容变化时才重建基础条目，首次 /km 空查询只走这一层
 function kaomoji.ensure_entries_loaded(env)
     local files_signature = generate_files_signature(env.kmj_files)
     if kaomoji.files_signature ~= files_signature then
@@ -356,11 +510,11 @@ function kaomoji.ensure_dict_loaded(env)
     kaomoji.ensure_entries_loaded(env)
 
     local files_sig = kaomoji.files_signature or ""
-    local dict_signature = table.concat(env.kmj_dict_files, "\n") .. "::" .. generate_files_signature(env.kmj_dict_files)
+    local dict_signature = get_dict_signature(env.kmj_dict_files)
     if kaomoji.dict_signature ~= dict_signature then
         if not load_forms_from_db(env, files_sig, dict_signature, kaomoji.entries) then
             reset_entry_forms(kaomoji.entries)
-            kaomoji.enrich_entries(kaomoji.entries, env.kmj_dict_files)
+            kaomoji.enrich_entries(kaomoji.entries, env.kmj_dict_files, env.kmj_projection)
             save_forms_to_db(env, files_sig, dict_signature, kaomoji.entries)
         end
         kaomoji.dict_signature = dict_signature
@@ -369,33 +523,19 @@ function kaomoji.ensure_dict_loaded(env)
     return kaomoji.entries
 end
 
--- 输入解析：仅接受 /kmj[a-z] 这类纯字母查询
-local function parse_query(input, key)
-    if input:sub(1, #key) ~= key then return nil end
-    local query = input:sub(#key + 1):lower()
-    if query:find("[^a-z]") then return nil end
-    return query
-end
-
 -- 匹配策略：支持关键词前缀、拼音全拼、首字母与模糊简拼
 local function match_entry(entry, query)
     if query == "" or entry.ascii_key:find(query, 1, true) then
         return true
     end
-
-    for _, form in ipairs(entry.forms) do
-        if form:find(query, 1, true) == 1 then
-            return true
-        end
-    end
-    return false
+    return is_query_match(entry.forms, query)
 end
 
 -- 收集候选：保持原文件顺序，同一颜文字只输出一次
 local function collect_matches(env, query)
     local matched = {}
     local seen = {}
-    local entries = query == "" and kaomoji.ensure_entries_loaded(env) or kaomoji.ensure_dict_loaded(env)
+    local entries = get_active_entries(env, query)
 
     for _, entry in ipairs(entries) do
         if match_entry(entry, query) and not seen[entry.text] then
@@ -410,11 +550,10 @@ end
 -- 初始化：读取配置并预热 userdb 缓存
 function kaomoji.init(env)
     local config = env.engine.schema.config
-    local key = config:get_string("kaomoji/kaomoji_key") or DEFAULT_KEY
-    local db_name = config:get_string("kaomoji/db_name") or DEFAULT_DB_NAME
 
-    env.kmj_key = key ~= "" and key or DEFAULT_KEY
-    env.kmj_db_name = db_name ~= "" and db_name or DEFAULT_DB_NAME
+    env.kmj_db_name = get_db_name(config)
+    env.kmj_prefix = get_query_prefix(config)
+    env.kmj_projection = get_algebra_projection(config)
     env.kmj_files = get_configured_files(config)
     env.kmj_dict_files = get_dict_files()
 
@@ -423,14 +562,12 @@ end
 
 -- translator 主入口：解析 query、生成候选、按排序结果输出
 function kaomoji.func(input, seg, env)
-    local query = parse_query(input, env.kmj_key or DEFAULT_KEY)
+    local query = get_kaomoji_query(input, seg, env)
     if query == nil then return end
 
     local yielded = 0
     for _, entry in ipairs(collect_matches(env, query)) do
-        local cand = Candidate("kaomoji", seg.start, seg._end, entry.text, entry.key)
-        cand.quality = 1000000 - yielded
-        yield(cand)
+        yield(build_candidate(seg, entry, yielded))
         yielded = yielded + 1
         if yielded >= DEFAULT_MAX_CANDIDATES then
             return
