@@ -8,6 +8,8 @@ local wanxiang = require("wanxiang/wanxiang")
 local DEFAULT_MAX_CANDIDATES = 80
 local BOM = string.char(239, 187, 191)
 local TAB = "\t"
+local DEFAULT_PRESET_FILE = "lua/data/kaomoji.txt"
+local DEFAULT_USER_FILE = "lua/data/kaomoji_user.txt"
 
 local kaomoji = {
     entries_signature = nil,
@@ -80,6 +82,26 @@ local function get_config_bool(config, path, default_value)
         return default_value
     end
     return value
+end
+
+local function get_default_kaomoji_files()
+    local files = {}
+    local preset = wanxiang.get_filename_with_fallback(DEFAULT_PRESET_FILE)
+    local user_file = rime_api.get_user_data_dir() .. "/" .. DEFAULT_USER_FILE
+
+    if preset then
+        files[#files + 1] = preset
+    end
+    files[#files + 1] = user_file
+    return files
+end
+
+local function get_kaomoji_files(config)
+    local files = get_config_list(config, "kaomoji/files")
+    if #files > 0 then
+        return files
+    end
+    return get_default_kaomoji_files()
 end
 
 local function extract_query_prefix(pattern)
@@ -521,7 +543,7 @@ end
 function kaomoji.init(env)
     local config = env.engine.schema.config
     env.kaomoji_prefix = get_query_prefix(config)
-    env.kaomoji_files = get_config_list(config, "kaomoji/files")
+    env.kaomoji_files = get_kaomoji_files(config)
     env.kaomoji_allowed_chars = get_allowed_query_chars(config)
     env.kaomoji_translator_path, env.kaomoji_translator_class = get_translator_path(config)
     env.kaomoji_enable_tone_fallback = get_config_bool(config, "super_processor/enable_tone_fallback", true)
