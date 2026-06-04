@@ -34,7 +34,6 @@
 ```yaml
 patch:
   kaomoji:
-    db_name: "lua/kaomoji"
     files:
       - lua/data/kaomoji.txt       # 默认文件
       #- lua/data/kaomoji_user.txt  # 用户自定义文件，要用的解除注释即可
@@ -43,7 +42,7 @@ patch:
     - lua_translator@*wanxiang.kaomoji
     
   recognizer/patterns/+:
-    kaomoji: "^/km[A-Za-z]*$"  #前缀可以在这里配置
+    kaomoji: "^/km[A-Za-z]*$"  #前缀可以在这里配置，如果需要双拼的话正则应该也在这修改（AI说的QAQ）
 ```
       
 
@@ -65,7 +64,7 @@ patch:
 ## 贡献
 ## Contributors
 
-### Human
+### Not a Human
 
 <a href="https://github.com/Battery-rar/rime-wanxiang-kaomoji/graphs/contributors">
 
@@ -73,11 +72,6 @@ patch:
 
 </a>
 
-### AI
-
-  ChatGPT 5.4
-  
-  Codex
 
 ### Cat
 
@@ -86,6 +80,13 @@ patch:
   <img src="https://github.com/deemoe404.png" width="50"/>
 
 </a>
+
+
+### AI
+
+  ChatGPT 5.4
+  
+  Codex
 
 
 
