@@ -64,20 +64,11 @@ patch:
 ## 贡献
 ## Contributors
 
-### Not a Human
+### Dog & Cat
 
 <a href="https://github.com/Battery-rar/rime-wanxiang-kaomoji/graphs/contributors">
 
-  <img src="https://contrib.rocks/image?repo=Battery-rar/rime-wanxiang-kaomoji" width="50"/>
-
-</a>
-
-
-### Cat
-
-<a href="https://github.com/deemoe404">
-
-  <img src="https://github.com/deemoe404.png" width="50"/>
+  <img src="https://contrib.rocks/image?repo=Battery-rar/rime-wanxiang-kaomoji" width="100"/>
 
 </a>
 
