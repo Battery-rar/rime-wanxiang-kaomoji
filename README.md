@@ -42,7 +42,7 @@ patch:
     - lua_translator@*wanxiang.kaomoji
     
   recognizer/patterns/+:
-    kaomoji: "^/km[A-Za-z]*$"  #前缀可以在这里配置，如果需要双拼的话正则应该也在这修改（AI说的QAQ）
+    kaomoji: "^/km[A-Za-z7890]*$"  #前缀可以在这里配置，如果需要双拼的话正则应该也在这修改（AI说的QAQ）
 ```
       
 
@@ -64,20 +64,11 @@ patch:
 ## 贡献
 ## Contributors
 
-### Not a Human
+### Dog & Cat
 
 <a href="https://github.com/Battery-rar/rime-wanxiang-kaomoji/graphs/contributors">
 
-  <img src="https://contrib.rocks/image?repo=Battery-rar/rime-wanxiang-kaomoji" width="50"/>
-
-</a>
-
-
-### Cat
-
-<a href="https://github.com/deemoe404">
-
-  <img src="https://github.com/deemoe404.png" width="50"/>
+  <img src="https://contrib.rocks/image?repo=Battery-rar/rime-wanxiang-kaomoji" width="100"/>
 
 </a>
 
