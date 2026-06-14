@@ -3,13 +3,15 @@
 
 local wanxiang = require("wanxiang/wanxiang")
 
-local DEFAULT_MAX_CANDIDATES = 50
+local DEFAULT_MAX_CANDIDATES = 12
 local DEFAULT_SCAN_LIMIT = 100
 local MAX_FALLBACK_STEPS = 6
 local BOM = string.char(239, 187, 191)
 local TAB = "\t"
+local TONE_DIGITS = "7890"
 local DEFAULT_PRESET_FILE = "lua/data/kaomoji.txt"
 local DEFAULT_USER_FILE = "lua/data/kaomoji_user.txt"
+local DEFAULT_PROMPT = "颜文字"
 
 local kaomoji = {}
 
@@ -49,6 +51,14 @@ local function config_list(config, path)
     return values
 end
 
+local function config_bool(config, path, default_value)
+    local ok, value = pcall(function()
+        return config:get_bool(path)
+    end)
+    if ok and value ~= nil then return value end
+    return default_value
+end
+
 local function default_files()
     local files = {}
     local preset = wanxiang.get_filename_with_fallback(DEFAULT_PRESET_FILE)
@@ -83,6 +93,121 @@ local function literal_prefix(pattern)
 
     local prefix = table.concat(chars)
     return prefix ~= "" and prefix or nil
+end
+
+local function is_tone_digit(char)
+    return char and TONE_DIGITS:find(char, 1, true) ~= nil
+end
+
+local function compress_tone_runs(text)
+    return (text or ""):gsub("([7890])([7890]+)", function(_, tail)
+        return tail:sub(-1)
+    end)
+end
+
+local function split_tone_query(query)
+    local clean, tones = {}, {}
+    for i = 1, #query do
+        local char = query:sub(i, i)
+        if is_tone_digit(char) then
+            tones[#tones + 1] = char
+        else
+            clean[#clean + 1] = char
+        end
+    end
+    return table.concat(clean), tones
+end
+
+local function get_script_text_parts(ctx)
+    local parts = {}
+    if not ctx or not ctx.composition or ctx.composition:empty() then return parts end
+
+    local spans = ctx.composition:spans()
+    if not spans then return parts end
+
+    local vertices = type(spans.vertices) == "function" and spans:vertices() or spans.vertices
+    if not vertices or #vertices < 2 then return parts end
+
+    local raw_input = ctx.input or ""
+    for i = 1, #vertices - 1 do
+        local part = raw_input:sub(vertices[i] + 1, vertices[i + 1]):gsub("['%s]", "")
+        if part ~= "" then parts[#parts + 1] = part end
+    end
+    return parts
+end
+
+local function build_tone_query(env, tones)
+    if #tones == 0 then return nil end
+
+    local syllables = get_script_text_parts(env.engine and env.engine.context)
+    if #syllables == 0 then return nil end
+
+    local prefix = env.kaomoji_prefix or ""
+    if prefix ~= "" and syllables[1] and syllables[1]:sub(1, #prefix) == prefix then
+        syllables[1] = syllables[1]:sub(#prefix + 1)
+    end
+    if syllables[1] == "" then table.remove(syllables, 1) end
+    if #syllables ~= #tones then return nil end
+
+    local query = {}
+    for i, tone in ipairs(tones) do
+        local syllable = syllables[i]
+        if not syllable or syllable == "" then return nil end
+        if #syllable > 2 then syllable = syllable:sub(1, 2) end
+        query[#query + 1] = syllable .. tone
+    end
+    return table.concat(query)
+end
+
+local function normalize_query(env, query)
+    if not env.kaomoji_enable_tone then return query end
+    if not query or query == "" or not query:find("[7890]") then return query end
+
+    local normalized = compress_tone_runs(query)
+    local clean_query, tones = split_tone_query(normalized)
+    if clean_query ~= "" then return normalized end
+
+    local tone_query = build_tone_query(env, tones)
+    return tone_query or normalized
+end
+
+local function tone_preedit_map(env)
+    if env.kaomoji_tone_map then return env.kaomoji_tone_map end
+
+    local map = {}
+    local config = env.engine and env.engine.schema and env.engine.schema.config
+    for d = 0, 9 do
+        local key = tostring(d)
+        local value = config and config:get_string("tone_preedit/" .. key)
+        map[key] = (value and value ~= "") and value or key
+    end
+    env.kaomoji_tone_map = map
+    return map
+end
+
+local function apply_tone_preedit(env, text)
+    if not text or text == "" then return text end
+    if not text:find("%d") then return text end
+
+    local map = tone_preedit_map(env)
+    return text:gsub("([^%d%s]+)(%d+)", function(body, digits)
+        local mapped = digits:gsub("%d", function(d)
+            return map[d] or d
+        end)
+        return body .. mapped
+    end)
+end
+
+local function apply_prompt(env)
+    local context = env.engine and env.engine.context
+    local composition = context and context.composition
+    if not composition or composition:empty() then return end
+
+    local segment = composition:back()
+    if not segment then return end
+    if segment.prompt ~= env.kaomoji_prompt_text then
+        segment.prompt = env.kaomoji_prompt_text
+    end
 end
 
 local function add_entry(index, list, seen, keyword, text)
@@ -138,9 +263,7 @@ local function limit_reached(yielded)
     return (yielded.__count or 0) >= DEFAULT_MAX_CANDIDATES
 end
 
-local apply_tone_preedit
-
-local function emit_items(items, seg, raw_input, env, yielded)
+local function emit_items(items, seg, preedit, yielded)
     if not items then return 0 end
 
     local count = 0
@@ -150,7 +273,7 @@ local function emit_items(items, seg, raw_input, env, yielded)
             yielded[item.text] = true
             local cand = Candidate("kaomoji", seg.start, seg._end, item.text, item.comment)
             cand.quality = 1000000 - (yielded.__count or 0)
-            cand.preedit = apply_tone_preedit(env, raw_input)
+            cand.preedit = preedit
             yield(cand)
             count = count + 1
             yielded.__count = (yielded.__count or 0) + 1
@@ -159,96 +282,68 @@ local function emit_items(items, seg, raw_input, env, yielded)
     return count
 end
 
-local function emit_by_keyword(keyword, seg, raw_input, env, yielded)
-    return emit_items(env.kaomoji_index[keyword], seg, raw_input, env, yielded)
+local function emit_by_keyword(keyword, seg, preedit, env, yielded)
+    return emit_items(env.kaomoji_index[keyword], seg, preedit, yielded)
 end
 
-local function query_translator(query, seg, raw_input, env, yielded)
-    if not env.kaomoji_translator then return 0 end
+local function query_translator(lookup_query, seg, preedit, env, yielded)
+    if not env.kaomoji_translator or not lookup_query or lookup_query == "" then return 0 end
 
     local scan_count, yield_count = 0, 0
-    local query_seg = Segment(0, #query)
+    local query_seg = Segment(0, #lookup_query)
     query_seg.tags = Set({ "abc" })
 
     local ok, translation = pcall(function()
-        return env.kaomoji_translator:query(query, query_seg)
+        return env.kaomoji_translator:query(lookup_query, query_seg)
     end)
     if not ok or not translation then return 0 end
 
     for cand in translation:iter() do
         if limit_reached(yielded) then break end
         scan_count = scan_count + 1
-        yield_count = yield_count + emit_by_keyword(cand.text, seg, raw_input, env, yielded)
+        yield_count = yield_count + emit_by_keyword(cand.text, seg, preedit, env, yielded)
         if limit_reached(yielded) or scan_count >= DEFAULT_SCAN_LIMIT then break end
     end
     return yield_count
 end
 
-local function query_memory(query, seg, raw_input, env, yielded)
-    if not env.kaomoji_memory then return 0 end
+local function query_memory(lookup_query, seg, preedit, env, yielded)
+    if not env.kaomoji_memory or not lookup_query or lookup_query == "" then return 0 end
 
     local yield_count = 0
-    if env.kaomoji_memory:dict_lookup(query, true, DEFAULT_SCAN_LIMIT) then
+    if env.kaomoji_memory:dict_lookup(lookup_query, true, DEFAULT_SCAN_LIMIT) then
         for entry in env.kaomoji_memory:iter_dict() do
             if limit_reached(yielded) then return yield_count end
-            yield_count = yield_count + emit_by_keyword(entry.text, seg, raw_input, env, yielded)
+            yield_count = yield_count + emit_by_keyword(entry.text, seg, preedit, env, yielded)
             if limit_reached(yielded) then return yield_count end
         end
     end
 
-    if env.kaomoji_memory:user_lookup(query, true) then
+    if env.kaomoji_memory:user_lookup(lookup_query, true) then
         for entry in env.kaomoji_memory:iter_user() do
             if limit_reached(yielded) then break end
-            yield_count = yield_count + emit_by_keyword(entry.text, seg, raw_input, env, yielded)
+            yield_count = yield_count + emit_by_keyword(entry.text, seg, preedit, env, yielded)
             if limit_reached(yielded) then break end
         end
     end
     return yield_count
 end
 
-local function query_native(query, seg, raw_input, env, yielded)
-    local count = query_translator(query, seg, raw_input, env, yielded)
+local function query_native(lookup_query, seg, preedit, env, yielded)
+    local count = query_translator(lookup_query, seg, preedit, env, yielded)
     if not limit_reached(yielded) then
-        count = count + query_memory(query, seg, raw_input, env, yielded)
+        count = count + query_memory(lookup_query, seg, preedit, env, yielded)
     end
     return count
-end
-
-local function get_tone_preedit_map(env)
-    if env.kaomoji_tone_map then
-        return env.kaomoji_tone_map
-    end
-
-    local tone_map = {}
-    local cfg = env.engine and env.engine.schema and env.engine.schema.config
-    for d = 0, 9 do
-        local key = tostring(d)
-        local value = cfg and cfg:get_string("tone_preedit/" .. key)
-        tone_map[key] = (value and value ~= "") and value or key
-    end
-
-    env.kaomoji_tone_map = tone_map
-    return tone_map
-end
-
-apply_tone_preedit = function(env, preedit)
-    if not preedit or preedit == "" then
-        return preedit
-    end
-
-    local tone_map = get_tone_preedit_map(env)
-    return preedit:gsub("([^%d%s]+)(%d+)", function(body, digits)
-        local mapped = digits:gsub("%d", function(d)
-            return tone_map[d] or d
-        end)
-        return body .. mapped
-    end)
 end
 
 function kaomoji.init(env)
     local config = env.engine.schema.config
     env.kaomoji_prefix = literal_prefix(config_string(config, "recognizer/patterns/kaomoji"))
+    env.kaomoji_prompt = config_string(config, "kaomoji/prompt") or DEFAULT_PROMPT
+    env.kaomoji_prompt_text = "〔" .. env.kaomoji_prompt .. "〕"
     env.kaomoji_index, env.kaomoji_list = load_data(kaomoji_files(config))
+    env.kaomoji_enable_tone = config_bool(config, "super_processor/enable_tone_fallback", true)
     env.kaomoji_memory = Memory and Memory(env.engine, env.engine.schema) or nil
 
     if Component and Component.Translator then
@@ -261,31 +356,33 @@ end
 function kaomoji.func(input, seg, env)
     local info = query_info(input, seg, env)
     if not info then return end
+    apply_prompt(env)
 
     local yielded = {}
+    local preedit = apply_tone_preedit(env, info.raw_input)
 
     if info.query == "" then
-        emit_items(env.kaomoji_list, seg, info.raw_input, env, yielded)
+        emit_items(env.kaomoji_list, seg, preedit, yielded)
         return
     end
 
     local query = info.query
     local fallback_steps = 0
     while true do
-        local count = query_native(query, seg, info.raw_input, env, yielded)
+        local count = query_native(normalize_query(env, query), seg, preedit, env, yielded)
         if count > 0 then
             return
         end
 
         if fallback_steps >= MAX_FALLBACK_STEPS then
-            emit_items(env.kaomoji_list, seg, info.raw_input, env, yielded)
+            emit_items(env.kaomoji_list, seg, preedit, yielded)
             return
         end
 
         query = query:sub(1, #query - 1)
         fallback_steps = fallback_steps + 1
         if query == "" then
-            emit_items(env.kaomoji_list, seg, info.raw_input, env, yielded)
+            emit_items(env.kaomoji_list, seg, preedit, yielded)
             return
         end
     end
