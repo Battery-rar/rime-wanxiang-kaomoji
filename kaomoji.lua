@@ -138,7 +138,9 @@ local function limit_reached(yielded)
     return (yielded.__count or 0) >= DEFAULT_MAX_CANDIDATES
 end
 
-local function emit_items(items, seg, raw_input, yielded)
+local apply_tone_preedit
+
+local function emit_items(items, seg, raw_input, env, yielded)
     if not items then return 0 end
 
     local count = 0
@@ -148,7 +150,7 @@ local function emit_items(items, seg, raw_input, yielded)
             yielded[item.text] = true
             local cand = Candidate("kaomoji", seg.start, seg._end, item.text, item.comment)
             cand.quality = 1000000 - (yielded.__count or 0)
-            cand.preedit = raw_input
+            cand.preedit = apply_tone_preedit(env, raw_input)
             yield(cand)
             count = count + 1
             yielded.__count = (yielded.__count or 0) + 1
@@ -158,7 +160,7 @@ local function emit_items(items, seg, raw_input, yielded)
 end
 
 local function emit_by_keyword(keyword, seg, raw_input, env, yielded)
-    return emit_items(env.kaomoji_index[keyword], seg, raw_input, yielded)
+    return emit_items(env.kaomoji_index[keyword], seg, raw_input, env, yielded)
 end
 
 local function query_translator(query, seg, raw_input, env, yielded)
@@ -212,6 +214,37 @@ local function query_native(query, seg, raw_input, env, yielded)
     return count
 end
 
+local function get_tone_preedit_map(env)
+    if env.kaomoji_tone_map then
+        return env.kaomoji_tone_map
+    end
+
+    local tone_map = {}
+    local cfg = env.engine and env.engine.schema and env.engine.schema.config
+    for d = 0, 9 do
+        local key = tostring(d)
+        local value = cfg and cfg:get_string("tone_preedit/" .. key)
+        tone_map[key] = (value and value ~= "") and value or key
+    end
+
+    env.kaomoji_tone_map = tone_map
+    return tone_map
+end
+
+apply_tone_preedit = function(env, preedit)
+    if not preedit or preedit == "" then
+        return preedit
+    end
+
+    local tone_map = get_tone_preedit_map(env)
+    return preedit:gsub("([^%d%s]+)(%d+)", function(body, digits)
+        local mapped = digits:gsub("%d", function(d)
+            return tone_map[d] or d
+        end)
+        return body .. mapped
+    end)
+end
+
 function kaomoji.init(env)
     local config = env.engine.schema.config
     env.kaomoji_prefix = literal_prefix(config_string(config, "recognizer/patterns/kaomoji"))
@@ -232,7 +265,7 @@ function kaomoji.func(input, seg, env)
     local yielded = {}
 
     if info.query == "" then
-        emit_items(env.kaomoji_list, seg, info.raw_input, yielded)
+        emit_items(env.kaomoji_list, seg, info.raw_input, env, yielded)
         return
     end
 
@@ -245,14 +278,14 @@ function kaomoji.func(input, seg, env)
         end
 
         if fallback_steps >= MAX_FALLBACK_STEPS then
-            emit_items(env.kaomoji_list, seg, info.raw_input, yielded)
+            emit_items(env.kaomoji_list, seg, info.raw_input, env, yielded)
             return
         end
 
         query = query:sub(1, #query - 1)
         fallback_steps = fallback_steps + 1
         if query == "" then
-            emit_items(env.kaomoji_list, seg, info.raw_input, yielded)
+            emit_items(env.kaomoji_list, seg, info.raw_input, env, yielded)
             return
         end
     end
