@@ -278,7 +278,7 @@ function kaomoji.func(input, seg, env)
     apply_prompt(env)
 
     local yielded = {}
-    local preedit = apply_tone_preedit(env, input)
+    local preedit = apply_tone_preedit(env, query)
 
     if query == "" then
         emit_items(env.kaomoji_fallback, seg, preedit, yielded)
