@@ -7,8 +7,6 @@ local DEFAULT_MAX_CANDIDATES = 12
 local DEFAULT_SCAN_LIMIT = 100
 local MAX_FALLBACK_STEPS = 6
 local BOM = string.char(239, 187, 191)
-local TAB = "\t"
-local TONE_DIGITS = "7890"
 local DEFAULT_PRESET_FILE = "lua/data/kaomoji.txt"
 local DEFAULT_USER_FILE = "lua/data/kaomoji_user.txt"
 local DEFAULT_PROMPT = "颜文字"
@@ -51,14 +49,6 @@ local function config_list(config, path)
     return values
 end
 
-local function config_bool(config, path, default_value)
-    local ok, value = pcall(function()
-        return config:get_bool(path)
-    end)
-    if ok and value ~= nil then return value end
-    return default_value
-end
-
 local function default_files()
     local files = {}
     local preset = wanxiang.get_filename_with_fallback(DEFAULT_PRESET_FILE)
@@ -93,82 +83,6 @@ local function literal_prefix(pattern)
 
     local prefix = table.concat(chars)
     return prefix ~= "" and prefix or nil
-end
-
-local function is_tone_digit(char)
-    return char and TONE_DIGITS:find(char, 1, true) ~= nil
-end
-
-local function compress_tone_runs(text)
-    return (text or ""):gsub("([7890])([7890]+)", function(_, tail)
-        return tail:sub(-1)
-    end)
-end
-
-local function split_tone_query(query)
-    local clean, tones = {}, {}
-    for i = 1, #query do
-        local char = query:sub(i, i)
-        if is_tone_digit(char) then
-            tones[#tones + 1] = char
-        else
-            clean[#clean + 1] = char
-        end
-    end
-    return table.concat(clean), tones
-end
-
-local function get_script_text_parts(ctx)
-    local parts = {}
-    if not ctx or not ctx.composition or ctx.composition:empty() then return parts end
-
-    local spans = ctx.composition:spans()
-    if not spans then return parts end
-
-    local vertices = type(spans.vertices) == "function" and spans:vertices() or spans.vertices
-    if not vertices or #vertices < 2 then return parts end
-
-    local raw_input = ctx.input or ""
-    for i = 1, #vertices - 1 do
-        local part = raw_input:sub(vertices[i] + 1, vertices[i + 1]):gsub("['%s]", "")
-        if part ~= "" then parts[#parts + 1] = part end
-    end
-    return parts
-end
-
-local function build_tone_query(env, tones)
-    if #tones == 0 then return nil end
-
-    local syllables = get_script_text_parts(env.engine and env.engine.context)
-    if #syllables == 0 then return nil end
-
-    local prefix = env.kaomoji_prefix or ""
-    if prefix ~= "" and syllables[1] and syllables[1]:sub(1, #prefix) == prefix then
-        syllables[1] = syllables[1]:sub(#prefix + 1)
-    end
-    if syllables[1] == "" then table.remove(syllables, 1) end
-    if #syllables ~= #tones then return nil end
-
-    local query = {}
-    for i, tone in ipairs(tones) do
-        local syllable = syllables[i]
-        if not syllable or syllable == "" then return nil end
-        if #syllable > 2 then syllable = syllable:sub(1, 2) end
-        query[#query + 1] = syllable .. tone
-    end
-    return table.concat(query)
-end
-
-local function normalize_query(env, query)
-    if not env.kaomoji_enable_tone then return query end
-    if not query or query == "" or not query:find("[7890]") then return query end
-
-    local normalized = compress_tone_runs(query)
-    local clean_query, tones = split_tone_query(normalized)
-    if clean_query ~= "" then return normalized end
-
-    local tone_query = build_tone_query(env, tones)
-    return tone_query or normalized
 end
 
 local function tone_preedit_map(env)
@@ -210,16 +124,19 @@ local function apply_prompt(env)
     end
 end
 
-local function add_entry(index, list, seen, keyword, text)
+local function add_entry(index, fallback, seen, fallback_seen, keyword, text)
     keyword, text = trim(keyword), trim(text)
     if keyword == "" or text == "" then return end
 
-    local uniq = keyword .. TAB .. text
+    local uniq = keyword .. "\t" .. text
     if seen[uniq] then return end
     seen[uniq] = true
 
     local item = { text = text, comment = keyword }
-    list[#list + 1] = item
+    if #fallback < DEFAULT_MAX_CANDIDATES and not fallback_seen[text] then
+        fallback_seen[text] = true
+        fallback[#fallback + 1] = item
+    end
 
     local bucket = index[keyword]
     if bucket then
@@ -230,7 +147,7 @@ local function add_entry(index, list, seen, keyword, text)
 end
 
 local function load_data(files)
-    local index, list, seen = {}, {}, {}
+    local index, fallback, seen, fallback_seen = {}, {}, {}, {}
 
     for _, path in ipairs(files) do
         local file = open_data_file(path, "r")
@@ -239,24 +156,23 @@ local function load_data(files)
                 local line = strip_bom(raw_line)
                 if trim(line) ~= "" and not line:match("^%s*#") then
                     local keyword, text = line:match("^([^\t]+)\t(.+)$")
-                    if keyword and text then add_entry(index, list, seen, keyword, text) end
+                    if keyword and text then add_entry(index, fallback, seen, fallback_seen, keyword, text) end
                 end
             end
             file:close()
         end
     end
 
-    return index, list
+    return index, fallback
 end
 
-local function query_info(input, seg, env)
+local function query_text(input, seg, env)
     if not seg:has_tag("kaomoji") then return nil end
 
     local prefix = env.kaomoji_prefix
     if not prefix or prefix == "" or input:sub(1, #prefix) ~= prefix then return nil end
 
-    local query = input:sub(#prefix + 1):lower()
-    return { raw_input = input, query = query }
+    return input:sub(#prefix + 1):lower()
 end
 
 local function limit_reached(yielded)
@@ -342,8 +258,7 @@ function kaomoji.init(env)
     env.kaomoji_prefix = literal_prefix(config_string(config, "recognizer/patterns/kaomoji"))
     env.kaomoji_prompt = config_string(config, "kaomoji/prompt") or DEFAULT_PROMPT
     env.kaomoji_prompt_text = "〔" .. env.kaomoji_prompt .. "〕"
-    env.kaomoji_index, env.kaomoji_list = load_data(kaomoji_files(config))
-    env.kaomoji_enable_tone = config_bool(config, "super_processor/enable_tone_fallback", true)
+    env.kaomoji_index, env.kaomoji_fallback = load_data(kaomoji_files(config))
     env.kaomoji_memory = Memory and Memory(env.engine, env.engine.schema) or nil
 
     if Component and Component.Translator then
@@ -353,36 +268,46 @@ function kaomoji.init(env)
     end
 end
 
+function kaomoji.fini(env)
+    if env.kaomoji_memory then
+        env.kaomoji_memory:disconnect()
+        env.kaomoji_memory = nil
+    end
+    env.kaomoji_translator = nil
+    env.kaomoji_index = nil
+    env.kaomoji_fallback = nil
+    env.kaomoji_tone_map = nil
+end
+
 function kaomoji.func(input, seg, env)
-    local info = query_info(input, seg, env)
-    if not info then return end
+    local query = query_text(input, seg, env)
+    if not query then return end
     apply_prompt(env)
 
     local yielded = {}
-    local preedit = apply_tone_preedit(env, info.raw_input)
+    local preedit = apply_tone_preedit(env, input)
 
-    if info.query == "" then
-        emit_items(env.kaomoji_list, seg, preedit, yielded)
+    if query == "" then
+        emit_items(env.kaomoji_fallback, seg, preedit, yielded)
         return
     end
 
-    local query = info.query
     local fallback_steps = 0
     while true do
-        local count = query_native(normalize_query(env, query), seg, preedit, env, yielded)
+        local count = query_native(query, seg, preedit, env, yielded)
         if count > 0 then
             return
         end
 
         if fallback_steps >= MAX_FALLBACK_STEPS then
-            emit_items(env.kaomoji_list, seg, preedit, yielded)
+            emit_items(env.kaomoji_fallback, seg, preedit, yielded)
             return
         end
 
         query = query:sub(1, #query - 1)
         fallback_steps = fallback_steps + 1
         if query == "" then
-            emit_items(env.kaomoji_list, seg, preedit, yielded)
+            emit_items(env.kaomoji_fallback, seg, preedit, yielded)
             return
         end
     end
