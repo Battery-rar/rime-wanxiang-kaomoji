@@ -236,28 +236,21 @@ local function query_memory(lookup_query, seg, preedit, env, yielded)
     end
 
     if env.kaomoji_memory:user_lookup(lookup_query, true) then
+        local scan_count = 0
         for entry in env.kaomoji_memory:iter_user() do
             if limit_reached(yielded) then break end
+            scan_count = scan_count + 1
             yield_count = yield_count + emit_by_keyword(entry.text, seg, preedit, env, yielded)
-            if limit_reached(yielded) then break end
+            if limit_reached(yielded) or scan_count >= DEFAULT_SCAN_LIMIT then break end
         end
     end
     return yield_count
 end
 
-local function query_native(lookup_query, seg, preedit, env, yielded)
-    local count = query_translator(lookup_query, seg, preedit, env, yielded)
-    if not limit_reached(yielded) then
-        count = count + query_memory(lookup_query, seg, preedit, env, yielded)
-    end
-    return count
-end
-
 function kaomoji.init(env)
     local config = env.engine.schema.config
     env.kaomoji_prefix = literal_prefix(config_string(config, "recognizer/patterns/kaomoji"))
-    env.kaomoji_prompt = config_string(config, "kaomoji/prompt") or DEFAULT_PROMPT
-    env.kaomoji_prompt_text = "〔" .. env.kaomoji_prompt .. "〕"
+    env.kaomoji_prompt_text = "〔" .. (config_string(config, "kaomoji/prompt") or DEFAULT_PROMPT) .. "〕"
     env.kaomoji_index, env.kaomoji_fallback = load_data(kaomoji_files(config))
     env.kaomoji_memory = Memory and Memory(env.engine, env.engine.schema) or nil
 
@@ -294,7 +287,10 @@ function kaomoji.func(input, seg, env)
 
     local fallback_steps = 0
     while true do
-        local count = query_native(query, seg, preedit, env, yielded)
+        local count = query_translator(query, seg, preedit, env, yielded)
+        if not limit_reached(yielded) then
+            count = count + query_memory(query, seg, preedit, env, yielded)
+        end
         if count > 0 then
             return
         end
