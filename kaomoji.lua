@@ -3,9 +3,9 @@
 
 local wanxiang = require("wanxiang/wanxiang")
 
-local DEFAULT_MAX_CANDIDATES = 12
-local DEFAULT_SCAN_LIMIT = 100
-local MAX_FALLBACK_STEPS = 6
+local DEFAULT_MAX_CANDIDATES = 18
+local DEFAULT_SCAN_LIMIT = 18
+local MAX_FALLBACK_STEPS = 3
 local BOM = string.char(239, 187, 191)
 local DEFAULT_PRESET_FILE = "lua/data/kaomoji.txt"
 local DEFAULT_USER_FILE = "lua/data/kaomoji_user.txt"
@@ -252,19 +252,15 @@ function kaomoji.init(env)
     env.kaomoji_prefix = literal_prefix(config_string(config, "recognizer/patterns/kaomoji"))
     env.kaomoji_prompt_text = "〔" .. (config_string(config, "kaomoji/prompt") or DEFAULT_PROMPT) .. "〕"
     env.kaomoji_index, env.kaomoji_fallback = load_data(kaomoji_files(config))
-    env.kaomoji_memory = Memory and Memory(env.engine, env.engine.schema) or nil
-
-    if Component and Component.Translator then
-        pcall(function()
-            env.kaomoji_translator = Component.Translator(env.engine, "translator", "script_translator")
-        end)
-    end
 end
 
 function kaomoji.fini(env)
     if env.kaomoji_memory then
         env.kaomoji_memory:disconnect()
         env.kaomoji_memory = nil
+    end
+    if env.kaomoji_translator and env.kaomoji_translator.disconnect then
+        pcall(function() env.kaomoji_translator:disconnect() end)
     end
     env.kaomoji_translator = nil
     env.kaomoji_index = nil
@@ -285,11 +281,19 @@ function kaomoji.func(input, seg, env)
         return
     end
 
+    -- ponytail: keep kaomoji native objects out of normal typing; create them only after /km has real input.
+    env.kaomoji_memory = env.kaomoji_memory or (Memory and Memory(env.engine, env.engine.schema) or nil)
+    if not env.kaomoji_translator and Component and Component.Translator then
+        pcall(function()
+            env.kaomoji_translator = Component.Translator(env.engine, "translator", "script_translator")
+        end)
+    end
+
     local fallback_steps = 0
     while true do
-        local count = query_translator(query, seg, preedit, env, yielded)
+        local count = query_memory(query, seg, preedit, env, yielded)
         if not limit_reached(yielded) then
-            count = count + query_memory(query, seg, preedit, env, yielded)
+            count = count + query_translator(query, seg, preedit, env, yielded)
         end
         if count > 0 then
             return
