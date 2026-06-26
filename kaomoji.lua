@@ -1,5 +1,5 @@
 -- 万象家族 lua，颜文字输入模块
--- 编码解析交给当前方案的原生 translator / Memory；本模块只做关键词到颜文字的映射。
+-- 编码解析交给当前方案的原生 translator；本模块只做关键词到颜文字的映射。
 
 local wanxiang = require("wanxiang/wanxiang")
 
@@ -21,19 +21,10 @@ local function strip_bom(text)
     return (text or ""):gsub("^" .. BOM, "")
 end
 
-local function is_absolute_path(path)
-    return path and (path:sub(1, 1) == "/" or path:sub(1, 1) == "\\" or path:match("^[A-Za-z]:[\\/]"))
-end
-
-local function open_data_file(path, mode)
+local function open_data_file(path)
     if not path or path == "" then return nil end
-    if is_absolute_path(path) then return io.open(path, mode or "r") end
-    return wanxiang.load_file_with_fallback(path, mode or "r")
-end
-
-local function config_string(config, path)
-    local value = trim(config:get_string(path))
-    return value ~= "" and value or nil
+    if path:sub(1, 1) == "/" or path:sub(1, 1) == "\\" or path:match("^[A-Za-z]:[\\/]") then return io.open(path, "r") end
+    return wanxiang.load_file_with_fallback(path, "r")
 end
 
 local function config_list(config, path)
@@ -47,19 +38,6 @@ local function config_list(config, path)
         if value ~= "" then values[#values + 1] = value end
     end
     return values
-end
-
-local function default_files()
-    local files = {}
-    local preset = wanxiang.get_filename_with_fallback(DEFAULT_PRESET_FILE)
-    if preset then files[#files + 1] = preset end
-    files[#files + 1] = rime_api.get_user_data_dir() .. "/" .. DEFAULT_USER_FILE
-    return files
-end
-
-local function kaomoji_files(config)
-    local files = config_list(config, "kaomoji/files")
-    return #files > 0 and files or default_files()
 end
 
 local function literal_prefix(pattern)
@@ -150,7 +128,7 @@ local function load_data(files)
     local index, fallback, seen, fallback_seen = {}, {}, {}, {}
 
     for _, path in ipairs(files) do
-        local file = open_data_file(path, "r")
+        local file = open_data_file(path)
         if file then
             for raw_line in file:lines() do
                 local line = strip_bom(raw_line)
@@ -167,16 +145,11 @@ local function load_data(files)
 end
 
 local function query_text(input, seg, env)
+    local prefix = env.kaomoji_prefix
+    if not prefix or prefix == "" or input:sub(1, env.kaomoji_prefix_len) ~= prefix then return nil end
     if not seg:has_tag("kaomoji") then return nil end
 
-    local prefix = env.kaomoji_prefix
-    if not prefix or prefix == "" or input:sub(1, #prefix) ~= prefix then return nil end
-
-    return input:sub(#prefix + 1):lower()
-end
-
-local function limit_reached(yielded)
-    return (yielded.__count or 0) >= DEFAULT_MAX_CANDIDATES
+    return input:sub(env.kaomoji_prefix_len + 1):lower()
 end
 
 local function emit_items(items, seg, preedit, yielded)
@@ -184,7 +157,7 @@ local function emit_items(items, seg, preedit, yielded)
 
     local count = 0
     for _, item in ipairs(items) do
-        if limit_reached(yielded) then break end
+        if (yielded.__count or 0) >= DEFAULT_MAX_CANDIDATES then break end
         if not yielded[item.text] then
             yielded[item.text] = true
             local cand = Candidate("kaomoji", seg.start, seg._end, item.text, item.comment)
@@ -198,12 +171,14 @@ local function emit_items(items, seg, preedit, yielded)
     return count
 end
 
-local function emit_by_keyword(keyword, seg, preedit, env, yielded)
-    return emit_items(env.kaomoji_index[keyword], seg, preedit, yielded)
-end
-
 local function query_translator(lookup_query, seg, preedit, env, yielded)
-    if not env.kaomoji_translator or not lookup_query or lookup_query == "" then return 0 end
+    if not lookup_query or lookup_query == "" then return 0 end
+    if not env.kaomoji_translator and Component and Component.Translator then
+        pcall(function()
+            env.kaomoji_translator = Component.Translator(env.engine, "translator", "script_translator")
+        end)
+    end
+    if not env.kaomoji_translator then return 0 end
 
     local scan_count, yield_count = 0, 0
     local query_seg = Segment(0, #lookup_query)
@@ -215,54 +190,37 @@ local function query_translator(lookup_query, seg, preedit, env, yielded)
     if not ok or not translation then return 0 end
 
     for cand in translation:iter() do
-        if limit_reached(yielded) then break end
+        if (yielded.__count or 0) >= DEFAULT_MAX_CANDIDATES then break end
         scan_count = scan_count + 1
-        yield_count = yield_count + emit_by_keyword(cand.text, seg, preedit, env, yielded)
-        if limit_reached(yielded) or scan_count >= DEFAULT_SCAN_LIMIT then break end
-    end
-    return yield_count
-end
-
-local function query_memory(lookup_query, seg, preedit, env, yielded)
-    if not env.kaomoji_memory or not lookup_query or lookup_query == "" then return 0 end
-
-    local yield_count = 0
-    if env.kaomoji_memory:dict_lookup(lookup_query, true, DEFAULT_SCAN_LIMIT) then
-        for entry in env.kaomoji_memory:iter_dict() do
-            if limit_reached(yielded) then return yield_count end
-            yield_count = yield_count + emit_by_keyword(entry.text, seg, preedit, env, yielded)
-            if limit_reached(yielded) then return yield_count end
-        end
-    end
-
-    if env.kaomoji_memory:user_lookup(lookup_query, true) then
-        local scan_count = 0
-        for entry in env.kaomoji_memory:iter_user() do
-            if limit_reached(yielded) then break end
-            scan_count = scan_count + 1
-            yield_count = yield_count + emit_by_keyword(entry.text, seg, preedit, env, yielded)
-            if limit_reached(yielded) or scan_count >= DEFAULT_SCAN_LIMIT then break end
-        end
+        yield_count = yield_count + emit_items(env.kaomoji_index[cand.text], seg, preedit, yielded)
+        if (yielded.__count or 0) >= DEFAULT_MAX_CANDIDATES or scan_count >= DEFAULT_SCAN_LIMIT then break end
     end
     return yield_count
 end
 
 function kaomoji.init(env)
     local config = env.engine.schema.config
-    env.kaomoji_prefix = literal_prefix(config_string(config, "recognizer/patterns/kaomoji"))
-    env.kaomoji_prompt_text = "〔" .. (config_string(config, "kaomoji/prompt") or DEFAULT_PROMPT) .. "〕"
-    env.kaomoji_index, env.kaomoji_fallback = load_data(kaomoji_files(config))
+    local pattern = trim(config:get_string("recognizer/patterns/kaomoji"))
+    local prompt = trim(config:get_string("kaomoji/prompt"))
+    local files = config_list(config, "kaomoji/files")
+    if #files == 0 then
+        local preset = wanxiang.get_filename_with_fallback(DEFAULT_PRESET_FILE)
+        if preset then files[#files + 1] = preset end
+        files[#files + 1] = rime_api.get_user_data_dir() .. "/" .. DEFAULT_USER_FILE
+    end
+
+    env.kaomoji_prefix = literal_prefix(pattern ~= "" and pattern or nil)
+    env.kaomoji_prefix_len = env.kaomoji_prefix and #env.kaomoji_prefix or 0
+    env.kaomoji_prompt_text = "〔" .. (prompt ~= "" and prompt or DEFAULT_PROMPT) .. "〕"
+    env.kaomoji_index, env.kaomoji_fallback = load_data(files)
 end
 
 function kaomoji.fini(env)
-    if env.kaomoji_memory then
-        env.kaomoji_memory:disconnect()
-        env.kaomoji_memory = nil
-    end
     if env.kaomoji_translator and env.kaomoji_translator.disconnect then
         pcall(function() env.kaomoji_translator:disconnect() end)
     end
     env.kaomoji_translator = nil
+    env.kaomoji_prefix_len = nil
     env.kaomoji_index = nil
     env.kaomoji_fallback = nil
     env.kaomoji_tone_map = nil
@@ -281,19 +239,11 @@ function kaomoji.func(input, seg, env)
         return
     end
 
-    -- ponytail: keep kaomoji native objects out of normal typing; create them only after /km has real input.
-    env.kaomoji_memory = env.kaomoji_memory or (Memory and Memory(env.engine, env.engine.schema) or nil)
-    if not env.kaomoji_translator and Component and Component.Translator then
-        pcall(function()
-            env.kaomoji_translator = Component.Translator(env.engine, "translator", "script_translator")
-        end)
-    end
-
     local fallback_steps = 0
     while true do
-        local count = query_memory(query, seg, preedit, env, yielded)
-        if not limit_reached(yielded) then
-            count = count + query_translator(query, seg, preedit, env, yielded)
+        local count = emit_items(env.kaomoji_index[query], seg, preedit, yielded)
+        if count == 0 then
+            count = query_translator(query, seg, preedit, env, yielded)
         end
         if count > 0 then
             return
